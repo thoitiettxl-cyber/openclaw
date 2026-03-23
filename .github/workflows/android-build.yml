@@ -1,0 +1,224 @@
+name: Android Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/android/**'
+      - '.github/workflows/android-build.yml'
+  pull_request:
+    paths:
+      - 'apps/android/**'
+      - '.github/workflows/android-build.yml'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Flavor to build'
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - play
+          - thirdParty
+      build_type:
+        description: 'Build type'
+        required: true
+        default: debug
+        type: choice
+        options:
+          - debug
+          - release
+      run_tests:
+        description: 'Run Android unit tests before build'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '17'
+  ANDROID_API_LEVEL: '36'
+  ANDROID_BUILD_TOOLS: '36.0.0'
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/android
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK cmdline-tools
+        run: |
+          set -euo pipefail
+          ANDROID_SDK_ROOT="$HOME/.android-sdk"
+          CMDLINE_TOOLS_VERSION="12266719"
+          ARCHIVE="commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip"
+          URL="https://dl.google.com/android/repository/${ARCHIVE}"
+
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL "$URL" -o "/tmp/${ARCHIVE}"
+          rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          unzip -q "/tmp/${ARCHIVE}" -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/dev/null
+          sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x ./gradlew
+
+      - name: Prepare release signing
+        if: github.event_name == 'workflow_dispatch' && inputs.build_type == 'release'
+        env:
+          OPENCLAW_ANDROID_STORE_FILE_B64: ${{ secrets.OPENCLAW_ANDROID_STORE_FILE_B64 }}
+          OPENCLAW_ANDROID_STORE_PASSWORD: ${{ secrets.OPENCLAW_ANDROID_STORE_PASSWORD }}
+          OPENCLAW_ANDROID_KEY_ALIAS: ${{ secrets.OPENCLAW_ANDROID_KEY_ALIAS }}
+          OPENCLAW_ANDROID_KEY_PASSWORD: ${{ secrets.OPENCLAW_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for key in \
+            OPENCLAW_ANDROID_STORE_FILE_B64 \
+            OPENCLAW_ANDROID_STORE_PASSWORD \
+            OPENCLAW_ANDROID_KEY_ALIAS \
+            OPENCLAW_ANDROID_KEY_PASSWORD; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing required secret: $key" >&2
+              exit 1
+            fi
+          done
+
+          STORE_FILE="$RUNNER_TEMP/openclaw-android.keystore"
+          printf '%s' "$OPENCLAW_ANDROID_STORE_FILE_B64" | base64 -d > "$STORE_FILE"
+
+          mkdir -p "$HOME/.gradle"
+          {
+            echo "OPENCLAW_ANDROID_STORE_FILE=$STORE_FILE"
+            echo "OPENCLAW_ANDROID_STORE_PASSWORD=$OPENCLAW_ANDROID_STORE_PASSWORD"
+            echo "OPENCLAW_ANDROID_KEY_ALIAS=$OPENCLAW_ANDROID_KEY_ALIAS"
+            echo "OPENCLAW_ANDROID_KEY_PASSWORD=$OPENCLAW_ANDROID_KEY_PASSWORD"
+          } >> "$HOME/.gradle/gradle.properties"
+
+      - name: Run Android unit tests
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        env:
+          FLAVOR: ${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'both' }}
+        run: |
+          set -euo pipefail
+          case "$FLAVOR" in
+            both)
+              ./gradlew --no-daemon :app:testPlayDebugUnitTest :app:testThirdPartyDebugUnitTest
+              ;;
+            play)
+              ./gradlew --no-daemon :app:testPlayDebugUnitTest
+              ;;
+            thirdParty)
+              ./gradlew --no-daemon :app:testThirdPartyDebugUnitTest
+              ;;
+            *)
+              echo "Unsupported flavor: $FLAVOR" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build Android artifacts
+        env:
+          FLAVOR: ${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'both' }}
+          BUILD_TYPE: ${{ github.event_name == 'workflow_dispatch' && inputs.build_type || 'debug' }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_TYPE" in
+            debug)
+              case "$FLAVOR" in
+                both)
+                  ./gradlew --no-daemon :app:assemblePlayDebug :app:assembleThirdPartyDebug
+                  ;;
+                play)
+                  ./gradlew --no-daemon :app:assemblePlayDebug
+                  ;;
+                thirdParty)
+                  ./gradlew --no-daemon :app:assembleThirdPartyDebug
+                  ;;
+                *)
+                  echo "Unsupported flavor: $FLAVOR" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            release)
+              case "$FLAVOR" in
+                both)
+                  ./gradlew --no-daemon :app:bundlePlayRelease :app:bundleThirdPartyRelease
+                  ;;
+                play)
+                  ./gradlew --no-daemon :app:bundlePlayRelease
+                  ;;
+                thirdParty)
+                  ./gradlew --no-daemon :app:bundleThirdPartyRelease
+                  ;;
+                *)
+                  echo "Unsupported flavor: $FLAVOR" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "Unsupported build_type: $BUILD_TYPE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Upload debug APKs
+        if: github.event_name != 'workflow_dispatch' || inputs.build_type == 'debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-artifacts
+          path: |
+            apps/android/app/build/outputs/apk/play/debug/*.apk
+            apps/android/app/build/outputs/apk/thirdParty/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload release bundles
+        if: github.event_name == 'workflow_dispatch' && inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-bundles
+          path: |
+            apps/android/app/build/outputs/bundle/playRelease/*.aab
+            apps/android/app/build/outputs/bundle/thirdPartyRelease/*.aab
+          if-no-files-found: error
+          retention-days: 14
